@@ -1,6 +1,6 @@
 streamlit>=1.30.0
 earthengine-api>=0.1.350
-geemap>=0.32.0
+geemap
 geopandas>=0.14.0
 pandas>=2.0.0
 numpy>=1.24.0
@@ -8,3 +8,5 @@ streamlit-folium>=0.15.0
 folium>=0.14.0
 plotly>=5.18.0
 google-auth>=2.20.0
+xyzservices==2023.10.1
+python-box==6.0.2
