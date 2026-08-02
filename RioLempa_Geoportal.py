@@ -1365,27 +1365,27 @@ def main() -> None:
     # -------------------------------------------------------------------------
     # Encabezado
     # -------------------------------------------------------------------------
-st.title("🚨 Sistema de Alerta Temprana | Cuenca del Río Lempa")
-
-st.markdown(
-    """
-    <div class="sat-subtitle">
-        Geoportal trinacional con precipitación CHIRPS, umbrales
-        hidroclimáticos locales, SPI y descargas de datos.
-        <br>
-        <span style="
-            display: inline-block;
-            margin-top: 6px;
-            font-size: 0.88rem;
-            color: #64748b;
-        ">
-            Elaborado por: <strong>Susana Melgar</strong> ·
-            Especialista GIS · Programa Somos Río Lempa
-        </span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+    st.title("🚨 Sistema de Alerta Temprana | Cuenca del Río Lempa")
+    
+    st.markdown(
+        """
+        <div class="sat-subtitle">
+            Geoportal trinacional con precipitación CHIRPS, umbrales
+            hidroclimáticos locales, SPI y descargas de datos.
+            <br>
+            <span style="
+                display: inline-block;
+                margin-top: 6px;
+                font-size: 0.88rem;
+                color: #64748b;
+            ">
+                Elaborado por: <strong>Susana Melgar</strong> ·
+                Especialista GIS · Programa Somos Río Lempa
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     selected_id = st.session_state.selected_id
     selected_feature = features_by_id.get(selected_id) if selected_id else None
