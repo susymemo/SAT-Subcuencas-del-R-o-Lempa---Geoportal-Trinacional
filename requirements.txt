@@ -1,16 +1,12 @@
-streamlit==1.37.0
+streamlit==1.37.1
 
-earthengine-api==1.1.7
+earthengine-api==1.6.5
+google-auth==2.35.0
 
-geemap==0.34.5
-
+geemap==0.35.3
 folium==0.17.0
 streamlit-folium==0.22.0
 
 geopandas==1.0.1
 pandas==2.2.2
 numpy==1.26.4
-
-xyzservices==2024.6.0
-
-google-auth==2.35.0
