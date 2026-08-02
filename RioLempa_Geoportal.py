@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
 import ee
-import geemap.foliumap as geemap
+import geemap
 from streamlit_folium import st_folium
 import pandas as pd
 from google.oauth2 import service_account
