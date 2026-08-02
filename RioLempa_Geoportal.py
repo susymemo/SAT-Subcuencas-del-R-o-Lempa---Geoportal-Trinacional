@@ -41,7 +41,7 @@ from streamlit_folium import st_folium
 # Configuración
 # =============================================================================
 
-APP_TITLE: Final = "SAT Río Lempa | Geoportal Hidroclimático"
+APP_TITLE: Final = "SAT - Cuenca del Río Lempa | Geoportal Hidroclimático Trinacional a nivel de subcuencas"
 HYBAS_ASSET: Final = "WWF/HydroSHEDS/v1/Basins/hybas_12"
 CHIRPS_ASSET: Final = "UCSB-CHG/CHIRPS/DAILY"
 CHIRPS_BAND: Final = "precipitation"
