@@ -2162,8 +2162,8 @@ def main() -> None:
 
     general_monitoring_tab, selected_analysis_tab = st.tabs(
         [
-            "📍 Análisis por subcuenca",
             "🚨 Monitoreo general",
+            "📍 Análisis por subcuenca",
         ]
     )
 
