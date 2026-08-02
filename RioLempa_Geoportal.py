@@ -1,135 +1,735 @@
 # -*- coding: utf-8 -*-
-import streamlit as st
+"""Geoportal SAT de la cuenca trinacional del río Lempa.
+
+Aplicación Streamlit + Google Earth Engine + Folium.
+No utiliza geemap, geopandas, xyzservices ni python-box.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Final
+
 import ee
-import geemap
-from streamlit_folium import st_folium
-import pandas as pd
+import folium
+import streamlit as st
+from folium.plugins import Fullscreen, MousePosition
 from google.oauth2 import service_account
+from streamlit_folium import st_folium
 
-# 1. CONFIGURACIÓN VISUAL INSTITUCIONAL
-st.set_page_config(page_title="SAT Río Lempa | Geoportal Hidroclimático", page_icon="🚨", layout="wide")
 
-st.markdown('''
-    <style>
-        .banner-semaforo {
-            padding: 18px; border-radius: 8px; margin-bottom: 20px;
-            font-family: 'Sitka Text', 'Sitka', Georgia, serif;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.06);
-        }
-    </style>
-''', unsafe_allow_html=True)
+# -----------------------------------------------------------------------------
+# Configuración general
+# -----------------------------------------------------------------------------
 
-# 2. AUTENTICACIÓN GEE SEGURA (Evita alertas de GitHub Secret Scanning)
-@st.cache_resource
-def init_gee():
+APP_TITLE: Final = "SAT Río Lempa | Geoportal Hidroclimático"
+HYBAS_ASSET: Final = "WWF/HydroSHEDS/v1/Basins/hybas_12"
+LEMPA_REFERENCE_POINT: Final = (-89.03, 14.02)  # longitud, latitud
+DEFAULT_CENTER: Final = [14.25, -89.15]
+DEFAULT_ZOOM: Final = 8
+EE_SCOPE: Final = "https://www.googleapis.com/auth/earthengine"
+
+P90_REF: Final = 35.0
+P95_REF: Final = 55.0
+P99_REF: Final = 90.0
+
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="🚨",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# -----------------------------------------------------------------------------
+# Modelos simples
+# -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AlertResult:
+    title: str
+    background: str
+    border: str
+    text: str
+    action: str
+    detail: str
+
+
+# -----------------------------------------------------------------------------
+# Estilos de la interfaz
+# -----------------------------------------------------------------------------
+
+
+def apply_styles() -> None:
+    st.markdown(
+        """
+        <style>
+            .block-container {
+                padding-top: 1.3rem;
+                padding-bottom: 2rem;
+                max-width: 1500px;
+            }
+
+            [data-testid="stSidebar"] {
+                border-right: 1px solid #e2e8f0;
+            }
+
+            .sat-subtitle {
+                color: #475569;
+                font-size: 1.02rem;
+                margin-top: -0.55rem;
+                margin-bottom: 0.7rem;
+            }
+
+            .sat-note {
+                padding: 0.85rem 1rem;
+                border-radius: 0.65rem;
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                color: #334155;
+                font-size: 0.94rem;
+            }
+
+            .alert-card {
+                border-radius: 0.75rem;
+                padding: 1rem 1.15rem;
+                margin-top: 0.8rem;
+                margin-bottom: 0.6rem;
+                box-shadow: 0 3px 10px rgba(15, 23, 42, 0.06);
+            }
+
+            .alert-location {
+                color: #475569;
+                font-size: 0.88rem;
+            }
+
+            .alert-title {
+                font-size: 1.28rem;
+                font-weight: 750;
+                margin: 0.35rem 0;
+            }
+
+            .alert-action {
+                color: #1e293b;
+                font-size: 0.98rem;
+            }
+
+            .alert-detail {
+                color: #64748b;
+                font-size: 0.86rem;
+                margin-top: 0.45rem;
+            }
+
+            div[data-testid="stMetric"] {
+                border: 1px solid #e2e8f0;
+                border-radius: 0.7rem;
+                padding: 0.75rem 0.85rem;
+                background: #ffffff;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Autenticación de Google Earth Engine
+# -----------------------------------------------------------------------------
+
+
+@st.cache_resource(show_spinner=False)
+def initialize_earth_engine() -> str:
+    """Inicializa Earth Engine con una cuenta de servicio guardada en st.secrets."""
+
     try:
-        # Se leen las credenciales desde el gestor de secretos de Streamlit
-        # En local, esto requiere un archivo .streamlit/secrets.toml
-        key_dict = dict(st.secrets["gcp_service_account"])
-        credentials = service_account.Credentials.from_service_account_info(key_dict)
-        scoped_credentials = credentials.with_scopes(['https://www.googleapis.com/auth/earthengine'])
-        ee.Initialize(scoped_credentials, project=key_dict.get("project_id", "gis-srl-2026"))
-    except Exception as e:
-        st.error(f"Error GEE: {e}. Asegúrate de configurar los secretos correctamente en .streamlit/secrets.toml.")
+        secret_section = st.secrets["gcp_service_account"]
+    except (FileNotFoundError, KeyError):
+        st.error("No se encontraron las credenciales de Google Earth Engine.")
+        st.info(
+            "Agrega la cuenta de servicio en **Settings → Secrets** de Streamlit "
+            "usando la sección `[gcp_service_account]`."
+        )
         st.stop()
 
-init_gee()
+    key_dict = dict(secret_section)
 
-# 3. CARGA DE DATOS ESPACIALES
-@st.cache_data
-def load_spatial_data():
-    cuencas_global = ee.FeatureCollection("WWF/HydroSHEDS/v1/Basins/hybas_12")
-    punto_lempa = ee.Geometry.Point([-89.03, 14.02])
-    cuenca_muestra = cuencas_global.filterBounds(punto_lempa).first()
-    LEMPA_MAIN_BAS = cuenca_muestra.get('MAIN_BAS')
-    subcuencas_lempa = cuencas_global.filter(ee.Filter.eq('MAIN_BAS', LEMPA_MAIN_BAS))
-    cuenca_estudio = subcuencas_lempa.union(100)
-    return subcuencas_lempa, cuenca_estudio
+    required_fields = {
+        "type",
+        "project_id",
+        "private_key_id",
+        "private_key",
+        "client_email",
+        "client_id",
+        "auth_uri",
+        "token_uri",
+        "auth_provider_x509_cert_url",
+        "client_x509_cert_url",
+    }
+    missing = sorted(required_fields.difference(key_dict))
+    if missing:
+        st.error(
+            "La sección `[gcp_service_account]` está incompleta. "
+            f"Faltan: {', '.join(missing)}"
+        )
+        st.stop()
 
-subcuencas_lempa, cuenca_estudio = load_spatial_data()
+    # Permite pegar en Streamlit una llave que contenga "\\n" literales.
+    private_key = str(key_dict["private_key"])
+    if "\\n" in private_key:
+        key_dict["private_key"] = private_key.replace("\\n", "\n")
 
-# 4. BARRA LATERAL: CONTROLADOR METEOROLÓGICO
-with st.sidebar:
-    st.title("🎛️ Panel Operativo SAT")
-    st.markdown("---")
-    st.subheader("🌧️ Simulador de Tormentas")
-    lluvia_evaluar = st.slider("Pronóstico de Lluvia (mm/día):", 0.0, 150.0, 45.0, 5.0)
-    
-    modulo_sat = st.radio("Módulo de Evaluación:", [
-        "🌊 Inundaciones (Escorrentía Corto Plazo)",
-        "☀️ Sequías (Índice SPI Mediano Plazo)"
-    ])
-    st.markdown("---")
-    st.caption("Estructura operativa centrada en el **Plan de Manejo de la Cuenca** | Programa *Somos Río Lempa*")
+    try:
+        credentials = service_account.Credentials.from_service_account_info(
+            key_dict,
+            scopes=[EE_SCOPE],
+        )
+        project_id = str(key_dict["project_id"])
+        ee.Initialize(credentials=credentials, project=project_id)
+        return project_id
+    except Exception as exc:
+        st.error("No fue posible iniciar Google Earth Engine.")
+        st.code(str(exc), language="text")
+        st.warning(
+            "Verifica que el proyecto esté registrado para Earth Engine, que la API "
+            "esté habilitada y que la cuenta de servicio tenga acceso al proyecto."
+        )
+        st.stop()
 
-# 5. ENCABEZADO PRINCIPAL
-st.title("🚨 Sistema de Alerta Temprana (SAT) | Cuenca Río Lempa")
-st.markdown("**Clasificación Espacial de Riesgos Hidroclimáticos y Directrices Operativas para el Plan de Manejo**")
 
-# Umbrales base (pueden ser dinámicos post-selección)
-P90_REF, P95_REF, P99_REF = 35.0, 55.0, 90.0
+# -----------------------------------------------------------------------------
+# Datos espaciales
+# -----------------------------------------------------------------------------
 
-col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
-col_kpi1.metric("Unidades de Drenaje", "139 Subcuencas", "HydroSHEDS Nivel 12")
-col_kpi2.metric("Umbral Preventivo (P90)", f"{P90_REF} mm/día", "Monitoreo cauces")
-col_kpi3.metric("Umbral Crítico (P95)", f"{P95_REF} mm/día", "Restricción agrícola")
-col_kpi4.metric("Umbral Emergencia (P99)", f"{P99_REF} mm/día", "Evacuación obligatoria", delta_color="inverse")
-st.markdown("---")
 
-# 6. MAPA INTERACTIVO PARA SELECCIÓN
-st.subheader("📍 Selección Territorial Directa")
-st.write("Haz clic en una subcuenca del mapa para evaluar su riesgo y visualizar las directrices del plan de manejo correspondientes (e.g. Río Tamulasco u otras zonas críticas).")
+def _lempa_collection() -> ee.FeatureCollection:
+    """Devuelve las subcuencas HydroSHEDS nivel 12 asociadas al río Lempa."""
 
-m = geemap.Map()
-m.centerObject(cuenca_estudio.geometry(), 9)
-estilo_subcuencas = {'color': '#555555', 'fillColor': '00000000', 'width': 1.5}
-m.addLayer(subcuencas_lempa.style(**estilo_subcuencas), {}, 'Subcuencas Nivel 12')
+    basins = ee.FeatureCollection(HYBAS_ASSET)
+    reference_point = ee.Geometry.Point(list(LEMPA_REFERENCE_POINT))
+    sample = ee.Feature(basins.filterBounds(reference_point).first())
+    main_basin_id = sample.get("MAIN_BAS")
+    return basins.filter(ee.Filter.eq("MAIN_BAS", main_basin_id))
 
-# Renderizar mapa y capturar clic
-map_data = st_folium(m, width=1200, height=500, returned_objects=["last_clicked"])
 
-subcuenca_id = "Ninguna (Selecciona en el mapa)"
+@st.cache_data(ttl=86_400, show_spinner=False)
+def load_lempa_geojson(project_id: str) -> dict[str, Any]:
+    """Descarga una versión simplificada de las subcuencas para dibujarla en Folium."""
 
-if map_data and map_data.get("last_clicked"):
-    lat = map_data["last_clicked"]["lat"]
-    lon = map_data["last_clicked"]["lng"]
-    punto_clic = ee.Geometry.Point([lon, lat])
-    
-    # Filtrar subcuenca cliqueada en GEE
-    cuenca_seleccionada = subcuencas_lempa.filterBounds(punto_clic)
-    
-    if cuenca_seleccionada.size().getInfo() > 0:
-        subcuenca_id = str(cuenca_seleccionada.first().get('HYBAS_ID').getInfo())
-        
-        # 7. LÓGICA DINÁMICA DEL SEMÁFORO Y PLAN DE MANEJO
-        if modulo_sat == "🌊 Inundaciones (Escorrentía Corto Plazo)":
-            if lluvia_evaluar >= P99_REF:
-                alerta_nivel = "🔴 ALERTA ROJA - EMERGENCIA POR ESCORRENTÍA"
-                bg_color, bord_color, txt_color = "#fef2f2", "#e74c3c", "#991b1b"
-                accion_sat = "EVACUACIÓN OBLIGATORIA en zonas vulnerables detectadas en el DEM."
-            elif lluvia_evaluar >= P95_REF:
-                alerta_nivel = "🟠 ALERTA NARANJA - ESTADO CRÍTICO"
-                bg_color, bord_color, txt_color = "#fff7ed", "#f18e21", "#9a3412"
-                accion_sat = "RESTRICCIÓN TEMPORAL de actividades agrícolas en riberas y llanuras aluviales."
-            elif lluvia_evaluar >= P90_REF:
-                alerta_nivel = "🟡 ALERTA AMARILLA - FASE PREVENTIVA"
-                bg_color, bord_color, txt_color = "#fefce8", "#f1c40f", "#854d0e"
-                accion_sat = "ACTIVACIÓN DE COMITÉS DE CUENCA y monitoreo intensivo de niveles en cauces."
-            else:
-                alerta_nivel = "🟢 ALERTA VERDE - SISTEMA ESTABLE"
-                bg_color, bord_color, txt_color = "#f0fdf4", "#089e49", "#166534"
-                accion_sat = "Precipitación dentro de la capacidad hidrológica. Continuar monitoreo estándar."
-        else:
-            alerta_nivel = "☀️ MONITOREO DE SEQUÍA ESTACIONAL (ÍNDICE SPI)"
-            bg_color, bord_color, txt_color = "#fefce8", "#f39c12", "#854d0e"
-            accion_sat = "Evaluación mensual: Para SPI < -1.0 activar protocolos de conservación de humedad."
+    del project_id  # Solo se usa como parte de la llave de caché.
 
-        st.markdown(f'''
-            <div class='banner-semaforo' style='background-color: {bg_color}; border-left: 8px solid {bord_color}; border: 1px solid {bord_color};'>
-                <div style='font-size: 14px; color: #475569;'>📍 <b>SUBCUENCA EVALUADA: {subcuenca_id}</b> &nbsp;|&nbsp; Lluvia: <b style='color: #0f172a;'>{lluvia_evaluar} mm/día</b></div>
-                <div style='font-size: 22px; font-weight: bold; color: {txt_color}; margin: 8px 0;'>{alerta_nivel}</div>
-                <div style='font-size: 15px; color: #1e293b;'>📋 <b style='color: {txt_color};'>Directriz del Plan de Manejo:</b> {accion_sat}</div>
+    collection = _lempa_collection().select(
+        ["HYBAS_ID", "MAIN_BAS", "SUB_AREA", "UP_AREA"]
+    )
+
+    def simplify_feature(feature: ee.Feature) -> ee.Feature:
+        feature = ee.Feature(feature)
+        simplified = feature.geometry().simplify(maxError=120)
+        return feature.setGeometry(simplified)
+
+    geojson = collection.map(simplify_feature).getInfo()
+
+    features = geojson.get("features", []) if isinstance(geojson, dict) else []
+    if not features:
+        raise RuntimeError("Earth Engine no devolvió subcuencas para el río Lempa.")
+
+    return geojson
+
+
+@st.cache_data(ttl=3_600, show_spinner=False)
+def find_subbasin_at(
+    longitude: float,
+    latitude: float,
+    project_id: str,
+) -> dict[str, Any] | None:
+    """Consulta la subcuenca que contiene el punto seleccionado."""
+
+    del project_id  # Solo se usa como parte de la llave de caché.
+
+    point = ee.Geometry.Point([longitude, latitude])
+    result = (
+        _lempa_collection()
+        .filterBounds(point)
+        .select(["HYBAS_ID", "MAIN_BAS", "SUB_AREA", "UP_AREA"])
+        .limit(1)
+        .getInfo()
+    )
+
+    features = result.get("features", []) if isinstance(result, dict) else []
+    if not features:
+        return None
+
+    properties = dict(features[0].get("properties", {}))
+    properties["longitude"] = longitude
+    properties["latitude"] = latitude
+    return properties
+
+
+# -----------------------------------------------------------------------------
+# Utilidades cartográficas
+# -----------------------------------------------------------------------------
+
+
+def _iter_coordinate_pairs(value: Any):
+    """Recorre recursivamente pares [longitud, latitud] de un GeoJSON."""
+
+    if (
+        isinstance(value, (list, tuple))
+        and len(value) >= 2
+        and isinstance(value[0], (int, float))
+        and isinstance(value[1], (int, float))
+    ):
+        yield float(value[0]), float(value[1])
+        return
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_coordinate_pairs(item)
+
+
+def geojson_bounds(geojson: dict[str, Any]) -> list[list[float]]:
+    """Calcula límites Leaflet [[sur,oeste],[norte,este]] desde un GeoJSON."""
+
+    pairs: list[tuple[float, float]] = []
+    for feature in geojson.get("features", []):
+        geometry = feature.get("geometry") or {}
+        pairs.extend(_iter_coordinate_pairs(geometry.get("coordinates", [])))
+
+    if not pairs:
+        return [[13.0, -90.5], [15.2, -87.5]]
+
+    longitudes = [pair[0] for pair in pairs]
+    latitudes = [pair[1] for pair in pairs]
+    return [
+        [min(latitudes), min(longitudes)],
+        [max(latitudes), max(longitudes)],
+    ]
+
+
+def build_map(
+    geojson: dict[str, Any],
+    selected_id: str | None,
+) -> folium.Map:
+    """Construye el mapa interactivo con Folium puro."""
+
+    map_object = folium.Map(
+        location=DEFAULT_CENTER,
+        zoom_start=DEFAULT_ZOOM,
+        tiles=None,
+        control_scale=True,
+        prefer_canvas=True,
+    )
+
+    folium.TileLayer(
+        tiles="OpenStreetMap",
+        name="Mapa base",
+        control=True,
+        show=True,
+    ).add_to(map_object)
+
+    folium.TileLayer(
+        tiles=(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/"
+            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        ),
+        attr=(
+            "Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, "
+            "and the GIS User Community"
+        ),
+        name="Imagen satelital",
+        control=True,
+        show=False,
+    ).add_to(map_object)
+
+    def style_function(feature: dict[str, Any]) -> dict[str, Any]:
+        feature_id = str(feature.get("properties", {}).get("HYBAS_ID", ""))
+        is_selected = selected_id is not None and feature_id == selected_id
+        return {
+            "color": "#b91c1c" if is_selected else "#334155",
+            "weight": 4 if is_selected else 1.4,
+            "fillColor": "#ef4444" if is_selected else "#38bdf8",
+            "fillOpacity": 0.32 if is_selected else 0.08,
+        }
+
+    def highlight_function(_: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "color": "#f59e0b",
+            "weight": 3,
+            "fillColor": "#fde68a",
+            "fillOpacity": 0.28,
+        }
+
+    folium.GeoJson(
+        data=geojson,
+        name="Subcuencas HydroSHEDS nivel 12",
+        style_function=style_function,
+        highlight_function=highlight_function,
+        tooltip=folium.GeoJsonTooltip(
+            fields=["HYBAS_ID", "SUB_AREA", "UP_AREA"],
+            aliases=["ID de subcuenca:", "Área local (km²):", "Área aguas arriba (km²):"],
+            localize=True,
+            sticky=False,
+            labels=True,
+            style=(
+                "background-color: white; color: #0f172a; "
+                "font-family: Arial; font-size: 12px; padding: 8px;"
+            ),
+        ),
+        popup=folium.GeoJsonPopup(
+            fields=["HYBAS_ID", "MAIN_BAS", "SUB_AREA", "UP_AREA"],
+            aliases=[
+                "HYBAS_ID:",
+                "Cuenca principal:",
+                "Área local (km²):",
+                "Área aguas arriba (km²):",
+            ],
+            localize=True,
+            labels=True,
+        ),
+        zoom_on_click=False,
+        smooth_factor=1.2,
+    ).add_to(map_object)
+
+    map_object.fit_bounds(geojson_bounds(geojson), padding=(12, 12))
+
+    Fullscreen(
+        position="topright",
+        title="Pantalla completa",
+        title_cancel="Salir de pantalla completa",
+        force_separate_button=True,
+    ).add_to(map_object)
+
+    MousePosition(
+        position="bottomright",
+        separator=" | ",
+        prefix="Coordenadas",
+        num_digits=5,
+    ).add_to(map_object)
+
+    folium.LayerControl(collapsed=True, position="topright").add_to(map_object)
+    return map_object
+
+
+# -----------------------------------------------------------------------------
+# Lógica de alertas
+# -----------------------------------------------------------------------------
+
+
+def evaluate_flood_alert(rainfall: float) -> AlertResult:
+    if rainfall >= P99_REF:
+        return AlertResult(
+            title="🔴 ALERTA ROJA — EMERGENCIA POR ESCORRENTÍA",
+            background="#fef2f2",
+            border="#dc2626",
+            text="#991b1b",
+            action=(
+                "Activar evacuación en zonas vulnerables, coordinar albergues y "
+                "mantener vigilancia continua de cauces y pasos críticos."
+            ),
+            detail=f"La lluvia simulada iguala o supera el umbral P99 ({P99_REF:.0f} mm/día).",
+        )
+    if rainfall >= P95_REF:
+        return AlertResult(
+            title="🟠 ALERTA NARANJA — ESTADO CRÍTICO",
+            background="#fff7ed",
+            border="#ea580c",
+            text="#9a3412",
+            action=(
+                "Restringir temporalmente actividades en riberas y llanuras de "
+                "inundación; preparar evacuaciones preventivas."
+            ),
+            detail=f"La lluvia simulada iguala o supera el umbral P95 ({P95_REF:.0f} mm/día).",
+        )
+    if rainfall >= P90_REF:
+        return AlertResult(
+            title="🟡 ALERTA AMARILLA — FASE PREVENTIVA",
+            background="#fefce8",
+            border="#ca8a04",
+            text="#854d0e",
+            action=(
+                "Activar comités de cuenca, verificar rutas de evacuación e "
+                "intensificar el monitoreo de niveles en cauces."
+            ),
+            detail=f"La lluvia simulada iguala o supera el umbral P90 ({P90_REF:.0f} mm/día).",
+        )
+    return AlertResult(
+        title="🟢 ALERTA VERDE — SISTEMA ESTABLE",
+        background="#f0fdf4",
+        border="#16a34a",
+        text="#166534",
+        action=(
+            "Mantener monitoreo ordinario y comunicar cualquier cambio observado "
+            "en niveles de ríos, drenajes o laderas."
+        ),
+        detail=f"La lluvia simulada permanece por debajo de P90 ({P90_REF:.0f} mm/día).",
+    )
+
+
+def evaluate_drought_alert(spi: float) -> AlertResult:
+    if spi <= -2.0:
+        return AlertResult(
+            title="🔴 SEQUÍA EXTREMA — RESPUESTA PRIORITARIA",
+            background="#fef2f2",
+            border="#dc2626",
+            text="#991b1b",
+            action=(
+                "Priorizar abastecimiento humano, activar planes de emergencia "
+                "hídrica y evaluar pérdidas agropecuarias."
+            ),
+            detail=f"SPI simulado: {spi:.1f} (sequía extrema).",
+        )
+    if spi <= -1.5:
+        return AlertResult(
+            title="🟠 SEQUÍA SEVERA — ESTADO CRÍTICO",
+            background="#fff7ed",
+            border="#ea580c",
+            text="#9a3412",
+            action=(
+                "Aplicar restricciones de uso no prioritario, reforzar reservorios "
+                "y activar asistencia técnica agropecuaria."
+            ),
+            detail=f"SPI simulado: {spi:.1f} (sequía severa).",
+        )
+    if spi <= -1.0:
+        return AlertResult(
+            title="🟡 SEQUÍA MODERADA — FASE PREVENTIVA",
+            background="#fefce8",
+            border="#ca8a04",
+            text="#854d0e",
+            action=(
+                "Promover conservación de humedad, revisar disponibilidad de agua "
+                "y preparar medidas de apoyo a cultivos sensibles."
+            ),
+            detail=f"SPI simulado: {spi:.1f} (sequía moderada).",
+        )
+    return AlertResult(
+        title="🟢 CONDICIÓN HÍDRICA SIN ALERTA DE SEQUÍA",
+        background="#f0fdf4",
+        border="#16a34a",
+        text="#166534",
+        action=(
+            "Continuar el seguimiento mensual y mantener medidas ordinarias de "
+            "uso eficiente y conservación del agua."
+        ),
+        detail=f"SPI simulado: {spi:.1f}.",
+    )
+
+
+def render_alert_card(
+    result: AlertResult,
+    selected: dict[str, Any] | None,
+    scenario_text: str,
+) -> None:
+    selected_id = (
+        str(selected.get("HYBAS_ID"))
+        if selected and selected.get("HYBAS_ID") is not None
+        else "Sin selección"
+    )
+
+    st.markdown(
+        f"""
+        <div class="alert-card"
+             style="background:{result.background}; border:1px solid {result.border};
+                    border-left:8px solid {result.border};">
+            <div class="alert-location">
+                📍 <b>SUBCUENCA EVALUADA:</b> {selected_id}
+                &nbsp;|&nbsp; <b>ESCENARIO:</b> {scenario_text}
             </div>
-        ''', unsafe_allow_html=True)
+            <div class="alert-title" style="color:{result.text};">
+                {result.title}
+            </div>
+            <div class="alert-action">
+                📋 <b style="color:{result.text};">Directriz operativa:</b>
+                {result.action}
+            </div>
+            <div class="alert-detail">{result.detail}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Aplicación
+# -----------------------------------------------------------------------------
+
+
+def main() -> None:
+    apply_styles()
+
+    project_id = initialize_earth_engine()
+
+    try:
+        with st.spinner("Cargando límites de subcuencas desde Earth Engine..."):
+            geojson = load_lempa_geojson(project_id)
+    except Exception as exc:
+        st.error("No fue posible cargar las subcuencas HydroSHEDS.")
+        st.code(str(exc), language="text")
+        st.stop()
+
+    if "selected_subbasin" not in st.session_state:
+        st.session_state.selected_subbasin = None
+
+    feature_count = len(geojson.get("features", []))
+
+    with st.sidebar:
+        st.title("🎛️ Panel operativo SAT")
+        st.caption(f"Earth Engine conectado: `{project_id}`")
+        st.divider()
+
+        module = st.radio(
+            "Módulo de evaluación",
+            options=["🌊 Inundaciones", "☀️ Sequías"],
+            index=0,
+        )
+
+        if module == "🌊 Inundaciones":
+            rainfall = st.slider(
+                "Lluvia simulada (mm/día)",
+                min_value=0.0,
+                max_value=150.0,
+                value=45.0,
+                step=5.0,
+            )
+            alert = evaluate_flood_alert(rainfall)
+            scenario_text = f"{rainfall:.0f} mm/día"
+        else:
+            spi = st.slider(
+                "Índice SPI simulado",
+                min_value=-3.0,
+                max_value=3.0,
+                value=-0.5,
+                step=0.1,
+                help=(
+                    "Valores negativos indican déficit. Como referencia operativa: "
+                    "SPI ≤ -1 sequía moderada, ≤ -1.5 severa y ≤ -2 extrema."
+                ),
+            )
+            alert = evaluate_drought_alert(spi)
+            scenario_text = f"SPI {spi:.1f}"
+
+        st.divider()
+        st.markdown("**Selección territorial**")
+        st.caption("Haz clic dentro de una subcuenca en el mapa.")
+
+        if st.button("Limpiar selección", use_container_width=True):
+            st.session_state.selected_subbasin = None
+            st.rerun()
+
+        st.divider()
+        st.caption(
+            "Herramienta demostrativa para apoyar la planificación de la cuenca. "
+            "Los umbrales deben validarse con datos y protocolos institucionales."
+        )
+
+    st.title("🚨 Sistema de Alerta Temprana | Cuenca del Río Lempa")
+    st.markdown(
+        "<div class='sat-subtitle'>Geoportal trinacional para la evaluación espacial "
+        "de escenarios hidroclimáticos y directrices operativas.</div>",
+        unsafe_allow_html=True,
+    )
+
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1.metric("Unidades de drenaje", f"{feature_count}", "HydroSHEDS nivel 12")
+    kpi2.metric("Umbral preventivo", f"{P90_REF:.0f} mm/día", "P90 de referencia")
+    kpi3.metric("Umbral crítico", f"{P95_REF:.0f} mm/día", "P95 de referencia")
+    kpi4.metric("Emergencia", f"{P99_REF:.0f} mm/día", "P99 de referencia")
+
+    st.divider()
+    st.subheader("📍 Selección territorial directa")
+    st.markdown(
+        "<div class='sat-note'>Haz clic dentro de una subcuenca. El sistema consultará "
+        "Earth Engine, resaltará el polígono seleccionado y aplicará el escenario "
+        "definido en el panel lateral.</div>",
+        unsafe_allow_html=True,
+    )
+
+    selected = st.session_state.selected_subbasin
+    selected_id = (
+        str(selected.get("HYBAS_ID"))
+        if selected and selected.get("HYBAS_ID") is not None
+        else None
+    )
+
+    map_object = build_map(geojson, selected_id)
+    map_data = st_folium(
+        map_object,
+        use_container_width=True,
+        height=560,
+        returned_objects=["last_clicked"],
+        key="rio_lempa_map",
+    )
+
+    clicked = map_data.get("last_clicked") if map_data else None
+    if clicked:
+        latitude = round(float(clicked["lat"]), 6)
+        longitude = round(float(clicked["lng"]), 6)
+
+        with st.spinner("Identificando subcuenca seleccionada..."):
+            clicked_subbasin = find_subbasin_at(
+                longitude=longitude,
+                latitude=latitude,
+                project_id=project_id,
+            )
+
+        previous_id = (
+            str(selected.get("HYBAS_ID"))
+            if selected and selected.get("HYBAS_ID") is not None
+            else None
+        )
+        clicked_id = (
+            str(clicked_subbasin.get("HYBAS_ID"))
+            if clicked_subbasin and clicked_subbasin.get("HYBAS_ID") is not None
+            else None
+        )
+
+        if clicked_id != previous_id:
+            st.session_state.selected_subbasin = clicked_subbasin
+            st.rerun()
+
+        if clicked_subbasin is None:
+            st.warning(
+                "El punto seleccionado está fuera de las subcuencas del área de estudio."
+            )
+
+    selected = st.session_state.selected_subbasin
+
+    if selected is None:
+        st.info("Selecciona una subcuenca para generar una evaluación territorial.")
     else:
-        st.warning("⚠️ Clic fuera del área de estudio. Selecciona un polígono dentro de la cuenca.")
+        render_alert_card(alert, selected, scenario_text)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("HYBAS_ID", str(selected.get("HYBAS_ID", "N/D")))
+        c2.metric("Cuenca principal", str(selected.get("MAIN_BAS", "N/D")))
+        c3.metric(
+            "Área local",
+            f"{float(selected.get('SUB_AREA', 0) or 0):,.1f} km²",
+        )
+        c4.metric(
+            "Área aguas arriba",
+            f"{float(selected.get('UP_AREA', 0) or 0):,.1f} km²",
+        )
+
+        st.caption(
+            "Punto consultado: "
+            f"{float(selected.get('latitude', 0)):.5f}, "
+            f"{float(selected.get('longitude', 0)):.5f}"
+        )
+
+    with st.expander("ℹ️ Alcance y uso responsable"):
+        st.markdown(
+            """
+            - La delimitación procede de **HydroSHEDS nivel 12** en Google Earth Engine.
+            - Los valores P90, P95 y P99 incluidos son **umbrales operativos de referencia**,
+              no percentiles calculados automáticamente para cada subcuenca.
+            - El módulo SPI es un simulador de clasificación; todavía no descarga ni calcula
+              series de precipitación.
+            - Antes de usar el resultado para decisiones oficiales, valida umbrales,
+              exposición, vulnerabilidad y protocolos con las instituciones responsables.
+            """
+        )
+
+
+if __name__ == "__main__":
+    main()
