@@ -1241,8 +1241,9 @@ def render_general_monitoring_tab(
         """
         <div class="sat-note">
             Esta sección revisa todas las subcuencas disponibles y señala cuáles requieren
-            <b>monitoreo hidroclimático</b>. El cálculo
-            se ejecuta únicamente al presionar el botón.
+            <b>monitoreo hidroclimático</b>. Para cuidar la cuota de Earth Engine, el cálculo
+            se ejecuta únicamente al presionar el botón y los resultados históricos se
+            conservan en caché.
         </div>
         """,
         unsafe_allow_html=True,
@@ -1985,6 +1986,8 @@ def main() -> None:
         st.caption(f"Último día CHIRPS disponible: **{latest_date:%d/%m/%Y}**")
         st.divider()
 
+        previous_selected_id = st.session_state.get("selected_id")
+
         selected_from_list = st.selectbox(
             "Seleccionar subcuenca",
             options=[None, *basin_ids],
@@ -1995,6 +1998,10 @@ def main() -> None:
                 else f"HYBAS_ID {value}"
             ),
         )
+
+        if selected_from_list != previous_selected_id:
+            st.session_state["main_view_tabs"] = "📍 Análisis por subcuenca"
+
         st.session_state.selected_id = selected_from_list
 
         selected_date = st.date_input(
@@ -2157,459 +2164,464 @@ def main() -> None:
 
     if clicked_id and clicked_id != selected_id:
         st.session_state.pending_selected_id = clicked_id
+        st.session_state["main_view_tabs"] = "📍 Análisis por subcuenca"
         st.rerun()
 
-    general_monitoring_tab, selected_analysis_tab = st.tabs(
+    selected_analysis_tab, general_monitoring_tab = st.tabs(
         [
-            "🚨 Monitoreo general",
             "📍 Análisis por subcuenca",
-        ]
+            "🚨 Monitoreo general",
+        ],
+        default="📍 Análisis por subcuenca",
+        key="main_view_tabs",
+        on_change="rerun",
     )
 
     with general_monitoring_tab:
-        render_general_monitoring_tab(
-            project_id=project_id,
-            selected_date=selected_date,
-            latest_date=latest_date,
-            spi_scale=int(spi_scale),
-            expected_basin_count=len(features_by_id),
-        )
+        if general_monitoring_tab.open:
+            render_general_monitoring_tab(
+                project_id=project_id,
+                selected_date=selected_date,
+                latest_date=latest_date,
+                spi_scale=int(spi_scale),
+                expected_basin_count=len(features_by_id),
+            )
 
     with selected_analysis_tab:
-        if selected_id is None or selected_feature is None:
-            st.info(
-                "Selecciona una subcuenca. Cuando el ID quede seleccionado, aparecerán "
-                "las pestañas **Resumen**, **Lluvia diaria**, **Climatología y SPI** y "
-                "**Descargas**. La pestaña de monitoreo general funciona sin selección."
+        if selected_analysis_tab.open:
+            if selected_id is None or selected_feature is None:
+                st.info(
+                    "Selecciona una subcuenca. Cuando el ID quede seleccionado, aparecerán "
+                    "las pestañas **Resumen**, **Lluvia diaria**, **Climatología y SPI** y "
+                    "**Descargas**. La pestaña de monitoreo general funciona sin selección."
+                )
+                with st.expander("Metodología que aplicará el sistema"):
+                    st.markdown(
+                        f"""
+                        - Fuente de precipitación: **CHIRPS Daily**, banda `{CHIRPS_BAND}`.
+                        - Resolución nominal: aproximadamente **5.6 km**.
+                        - Umbrales P90, P95 y P99: percentiles de la precipitación diaria media
+                          de la subcuenca durante **{REFERENCE_START_YEAR}–{REFERENCE_END_YEAR}**,
+                          para el mismo mes calendario y considerando días húmedos
+                          (≥ {WET_DAY_THRESHOLD_MM:.0f} mm).
+                        - SPI: ajuste gamma por mes calendario y transformación a distribución
+                          normal estándar.
+                        """
+                    )
+                return
+
+            # -------------------------------------------------------------------------
+            # Análisis dinámico de la subcuenca
+            # -------------------------------------------------------------------------
+            properties = selected_feature.get("properties", {})
+            start_date = max(
+                date(1981, 1, 1),
+                selected_date - timedelta(days=int(daily_window) - 1),
             )
-            with st.expander("Metodología que aplicará el sistema"):
+
+            try:
+                with st.spinner(
+                    "Calculando precipitación, percentiles locales, climatología y SPI..."
+                ):
+                    daily_df = get_daily_rainfall(
+                        selected_id,
+                        start_date.isoformat(),
+                        selected_date.isoformat(),
+                        project_id,
+                    )
+                    reference_df = get_month_reference_rainfall(
+                        selected_id,
+                        selected_date.month,
+                        project_id,
+                    )
+                    thresholds = calculate_thresholds(reference_df, selected_date.month)
+
+                    end_month = latest_complete_month(latest_date)
+                    monthly_df = get_monthly_rainfall(
+                        selected_id,
+                        str(end_month),
+                        project_id,
+                    )
+                    spi_df = calculate_spi(monthly_df, int(spi_scale))
+            except Exception as exc:
+                st.error("No fue posible completar el análisis hidroclimático.")
+                st.code(str(exc), language="text")
+                st.info(
+                    "Puedes limpiar la selección e intentar otra subcuenca. Si el error "
+                    "persiste, revisa los permisos o cuotas de Earth Engine."
+                )
+                st.stop()
+
+            observation = selected_observation(daily_df, selected_date)
+            if observation is None:
+                observed_date = selected_date
+                observed_rain = math.nan
+            else:
+                observed_date, observed_rain = observation
+
+            if evaluation_mode == "Escenario manual":
+                default_scenario = float(round(thresholds.p90, 1))
+                maximum_scenario = float(max(200.0, math.ceil(thresholds.p99 * 1.8 / 10) * 10))
+                manual_rain = st.sidebar.number_input(
+                    "Lluvia del escenario (mm/día)",
+                    min_value=0.0,
+                    max_value=maximum_scenario,
+                    value=min(default_scenario, maximum_scenario),
+                    step=1.0,
+                )
+                evaluated_rain = float(manual_rain)
+                evaluation_label = f"Escenario manual: {evaluated_rain:.1f} mm/día"
+            else:
+                evaluated_rain = float(observed_rain)
+                evaluation_label = (
+                    f"CHIRPS {observed_date:%d/%m/%Y}: {evaluated_rain:.1f} mm/día"
+                    if np.isfinite(evaluated_rain)
+                    else "Sin observación disponible"
+                )
+
+            # Sobrescribir KPIs con valores reales. Streamlit los muestra aquí como bloque final.
+            st.markdown("#### Umbrales calculados para la selección")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("HYBAS_ID", selected_id, MONTH_NAMES[selected_date.month])
+            k2.metric("P90 local", f"{thresholds.p90:.1f} mm/día", "Preventivo")
+            k3.metric("P95 local", f"{thresholds.p95:.1f} mm/día", "Muy alto")
+            k4.metric("P99 local", f"{thresholds.p99:.1f} mm/día", "Extremo")
+
+            tab_summary, tab_daily, tab_climate, tab_downloads = st.tabs(
+                [
+                    "📊 Resumen",
+                    "🌧️ Lluvia diaria y umbrales",
+                    "☀️ Climatología y SPI",
+                    "⬇️ Descargas",
+                ]
+            )
+
+            # -------------------------------------------------------------------------
+            # Resumen
+            # -------------------------------------------------------------------------
+            with tab_summary:
+                st.subheader("Evaluación territorial")
+
+                if np.isfinite(evaluated_rain):
+                    flood_alert = evaluate_flood_alert(evaluated_rain, thresholds)
+                    render_alert_card(flood_alert, selected_id, evaluation_label)
+                else:
+                    flood_alert = None
+                    st.warning("No hay una observación CHIRPS disponible para la fecha evaluada.")
+
+                area1, area2, acc3, acc7, acc30 = st.columns(5)
+                area1.metric(
+                    "Área local",
+                    safe_metric(float(properties.get("SUB_AREA", math.nan)), " km²"),
+                )
+                area2.metric(
+                    "Área aguas arriba",
+                    safe_metric(float(properties.get("UP_AREA", math.nan)), " km²"),
+                )
+                acc3.metric(
+                    "Acumulado 3 días",
+                    safe_metric(sum_last_days(daily_df, observed_date, 3), " mm"),
+                )
+                acc7.metric(
+                    "Acumulado 7 días",
+                    safe_metric(sum_last_days(daily_df, observed_date, 7), " mm"),
+                )
+                acc30.metric(
+                    "Acumulado 30 días",
+                    safe_metric(sum_last_days(daily_df, observed_date, 30), " mm"),
+                )
+
+                latest_spi_rows = spi_df.loc[
+                    spi_df["fecha"] <= pd.Timestamp(selected_date),
+                ].dropna(subset=["spi"])
+                latest_spi = (
+                    float(latest_spi_rows.iloc[-1]["spi"])
+                    if not latest_spi_rows.empty
+                    else math.nan
+                )
+                latest_spi_date = (
+                    latest_spi_rows.iloc[-1]["fecha"].date()
+                    if not latest_spi_rows.empty
+                    else None
+                )
+
+                st.subheader(f"Condición de sequía — SPI-{spi_scale}")
+                if np.isfinite(latest_spi):
+                    drought_alert = evaluate_drought_alert(latest_spi)
+                    render_alert_card(
+                        drought_alert,
+                        selected_id,
+                        f"{latest_spi_date:%m/%Y} · SPI-{spi_scale} = {latest_spi:.2f}",
+                    )
+                else:
+                    drought_alert = None
+                    st.info("No fue posible calcular SPI para el período seleccionado.")
+
                 st.markdown(
                     f"""
-                    - Fuente de precipitación: **CHIRPS Daily**, banda `{CHIRPS_BAND}`.
-                    - Resolución nominal: aproximadamente **5.6 km**.
-                    - Umbrales P90, P95 y P99: percentiles de la precipitación diaria media
-                      de la subcuenca durante **{REFERENCE_START_YEAR}–{REFERENCE_END_YEAR}**,
-                      para el mismo mes calendario y considerando días húmedos
-                      (≥ {WET_DAY_THRESHOLD_MM:.0f} mm).
-                    - SPI: ajuste gamma por mes calendario y transformación a distribución
-                      normal estándar.
+                    <div class="method-card">
+                        <b>Cómo se obtuvieron los umbrales:</b> se calculó la precipitación diaria
+                        media espacial de la subcuenca para todos los días de
+                        <b>{MONTH_NAMES[selected_date.month]}</b> entre
+                        <b>{REFERENCE_START_YEAR} y {REFERENCE_END_YEAR}</b>. Después se conservaron
+                        los días con lluvia ≥ {WET_DAY_THRESHOLD_MM:.0f} mm y se calcularon los
+                        percentiles P90, P95 y P99. Muestra: <b>{thresholds.sample_wet}</b> días
+                        húmedos de <b>{thresholds.sample_all}</b> días disponibles.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            # -------------------------------------------------------------------------
+            # Lluvia diaria
+            # -------------------------------------------------------------------------
+            with tab_daily:
+                st.plotly_chart(
+                    daily_rainfall_chart(daily_df, thresholds, observed_date),
+                    use_container_width=True,
+                    config={"displaylogo": False, "scrollZoom": False},
+                )
+
+                left_chart, right_chart = st.columns([1.6, 1])
+                with left_chart:
+                    st.plotly_chart(
+                        reference_distribution_chart(reference_df, thresholds),
+                        use_container_width=True,
+                        config={"displaylogo": False},
+                    )
+                with right_chart:
+                    threshold_table = pd.DataFrame(
+                        {
+                            "Indicador": ["P90", "P95", "P99"],
+                            "Valor_mm_dia": [
+                                thresholds.p90,
+                                thresholds.p95,
+                                thresholds.p99,
+                            ],
+                            "Interpretación": [
+                                "Preventivo",
+                                "Muy alto",
+                                "Extremo",
+                            ],
+                        }
+                    )
+                    st.markdown("#### Tabla de umbrales")
+                    st.dataframe(
+                        threshold_table.style.format({"Valor_mm_dia": "{:.2f}"}),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.markdown("#### Datos diarios")
+                    table_daily = daily_df.copy()
+                    table_daily["fecha"] = table_daily["fecha"].dt.strftime("%Y-%m-%d")
+                    st.dataframe(
+                        table_daily.tail(30),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=360,
+                    )
+
+            # -------------------------------------------------------------------------
+            # Climatología y SPI
+            # -------------------------------------------------------------------------
+            with tab_climate:
+                chart_col1, chart_col2 = st.columns(2)
+                with chart_col1:
+                    st.plotly_chart(
+                        monthly_climatology_chart(monthly_df),
+                        use_container_width=True,
+                        config={"displaylogo": False},
+                    )
+                with chart_col2:
+                    st.plotly_chart(
+                        monthly_series_chart(monthly_df),
+                        use_container_width=True,
+                        config={"displaylogo": False},
+                    )
+
+                st.plotly_chart(
+                    spi_chart(spi_df, int(spi_scale)),
+                    use_container_width=True,
+                    config={"displaylogo": False},
+                )
+
+                spi_table = spi_df.dropna(subset=["spi"]).tail(24).copy()
+                spi_table["fecha"] = spi_table["fecha"].dt.strftime("%Y-%m")
+                spi_table = spi_table[
+                    ["fecha", "precipitacion_mm", "acumulado_mm", "spi", "escala_meses"]
+                ]
+                st.dataframe(
+                    spi_table.style.format(
+                        {
+                            "precipitacion_mm": "{:.2f}",
+                            "acumulado_mm": "{:.2f}",
+                            "spi": "{:.2f}",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            # -------------------------------------------------------------------------
+            # Descargas
+            # -------------------------------------------------------------------------
+            with tab_downloads:
+                st.subheader("Descarga de resultados")
+
+                thresholds_df = pd.DataFrame(
+                    [
+                        {
+                            "HYBAS_ID": selected_id,
+                            "mes": selected_date.month,
+                            "mes_nombre": MONTH_NAMES[selected_date.month],
+                            "periodo_referencia": (
+                                f"{REFERENCE_START_YEAR}-{REFERENCE_END_YEAR}"
+                            ),
+                            "criterio_dia_humedo_mm": WET_DAY_THRESHOLD_MM,
+                            "muestra_total_dias": thresholds.sample_all,
+                            "muestra_dias_humedos": thresholds.sample_wet,
+                            "P90_mm_dia": thresholds.p90,
+                            "P95_mm_dia": thresholds.p95,
+                            "P99_mm_dia": thresholds.p99,
+                        }
+                    ]
+                )
+
+                latest_spi_value = (
+                    latest_spi if np.isfinite(latest_spi) else None
+                )
+                summary_df = pd.DataFrame(
+                    [
+                        {
+                            "HYBAS_ID": selected_id,
+                            "MAIN_BAS": properties.get("MAIN_BAS"),
+                            "SUB_AREA_km2": properties.get("SUB_AREA"),
+                            "UP_AREA_km2": properties.get("UP_AREA"),
+                            "fecha_solicitada": selected_date.isoformat(),
+                            "fecha_observada": observed_date.isoformat(),
+                            "precipitacion_evaluada_mm_dia": (
+                                evaluated_rain if np.isfinite(evaluated_rain) else None
+                            ),
+                            "modo_evaluacion": evaluation_mode,
+                            "alerta_lluvia": flood_alert.level if flood_alert else None,
+                            "SPI_escala_meses": spi_scale,
+                            "SPI_fecha": (
+                                latest_spi_date.isoformat() if latest_spi_date else None
+                            ),
+                            "SPI_valor": latest_spi_value,
+                            "alerta_sequia": drought_alert.level if drought_alert else None,
+                            "fuente": CHIRPS_ASSET,
+                        }
+                    ]
+                )
+
+                export_daily = daily_df.copy()
+                export_daily["HYBAS_ID"] = selected_id
+                export_monthly = monthly_df.copy()
+                export_monthly["HYBAS_ID"] = selected_id
+                export_spi = spi_df.copy()
+                export_spi["HYBAS_ID"] = selected_id
+
+                files = {
+                    f"resumen_{selected_id}.csv": dataframe_csv_bytes(summary_df),
+                    f"umbrales_{selected_id}_{selected_date.month:02d}.csv": dataframe_csv_bytes(
+                        thresholds_df
+                    ),
+                    f"precipitacion_diaria_{selected_id}.csv": dataframe_csv_bytes(
+                        export_daily
+                    ),
+                    f"precipitacion_mensual_{selected_id}.csv": dataframe_csv_bytes(
+                        export_monthly
+                    ),
+                    f"spi_{spi_scale}_{selected_id}.csv": dataframe_csv_bytes(export_spi),
+                    f"subcuenca_{selected_id}.geojson": selected_geojson_bytes(
+                        selected_feature
+                    ),
+                }
+
+                st.download_button(
+                    "📦 Descargar paquete completo ZIP",
+                    data=create_download_zip(files),
+                    file_name=f"SAT_Rio_Lempa_{selected_id}.zip",
+                    mime="application/zip",
+                    type="primary",
+                    width="stretch",
+                    on_click="ignore",
+                )
+
+                download_columns = st.columns(3)
+                with download_columns[0]:
+                    st.download_button(
+                        "Resumen CSV",
+                        dataframe_csv_bytes(summary_df),
+                        file_name=f"resumen_{selected_id}.csv",
+                        mime="text/csv",
+                        width="stretch",
+                        on_click="ignore",
+                    )
+                    st.download_button(
+                        "Serie diaria CSV",
+                        dataframe_csv_bytes(export_daily),
+                        file_name=f"precipitacion_diaria_{selected_id}.csv",
+                        mime="text/csv",
+                        width="stretch",
+                        on_click="ignore",
+                    )
+                with download_columns[1]:
+                    st.download_button(
+                        "Umbrales CSV",
+                        dataframe_csv_bytes(thresholds_df),
+                        file_name=f"umbrales_{selected_id}.csv",
+                        mime="text/csv",
+                        width="stretch",
+                        on_click="ignore",
+                    )
+                    st.download_button(
+                        "Serie mensual CSV",
+                        dataframe_csv_bytes(export_monthly),
+                        file_name=f"precipitacion_mensual_{selected_id}.csv",
+                        mime="text/csv",
+                        width="stretch",
+                        on_click="ignore",
+                    )
+                with download_columns[2]:
+                    st.download_button(
+                        f"SPI-{spi_scale} CSV",
+                        dataframe_csv_bytes(export_spi),
+                        file_name=f"spi_{spi_scale}_{selected_id}.csv",
+                        mime="text/csv",
+                        width="stretch",
+                        on_click="ignore",
+                    )
+                    st.download_button(
+                        "Subcuenca GeoJSON",
+                        selected_geojson_bytes(selected_feature),
+                        file_name=f"subcuenca_{selected_id}.geojson",
+                        mime="application/geo+json",
+                        width="stretch",
+                        on_click="ignore",
+                    )
+
+                st.caption(
+                    "Los CSV se exportan con codificación UTF-8 con BOM para facilitar su "
+                    "apertura en Excel."
+                )
+
+            with st.expander("ℹ️ Alcance, datos y uso responsable"):
+                st.markdown(
+                    f"""
+                    - **CHIRPS** es una estimación satelital combinada con estaciones; no sustituye
+                      mediciones hidrometeorológicas locales ni pronósticos oficiales.
+                    - La precipitación mostrada es la **media espacial** de la subcuenca, no el
+                      máximo puntual dentro de ella.
+                    - Los percentiles son estadísticos hidroclimáticos reales calculados con
+                      CHIRPS, pero **no equivalen por sí solos a umbrales oficiales de inundación**.
+                      Para operación institucional deben combinarse con niveles de río, humedad
+                      antecedente, topografía, exposición, vulnerabilidad y protocolos nacionales.
+                    - El SPI se calcula con período de referencia
+                      **{REFERENCE_START_YEAR}–{REFERENCE_END_YEAR}** y distribución gamma.
+                    - Delimitación: HydroSHEDS nivel 12. Fuente de lluvia: `{CHIRPS_ASSET}`.
                     """
                 )
-            return
-
-        # -------------------------------------------------------------------------
-        # Análisis dinámico de la subcuenca
-        # -------------------------------------------------------------------------
-        properties = selected_feature.get("properties", {})
-        start_date = max(
-            date(1981, 1, 1),
-            selected_date - timedelta(days=int(daily_window) - 1),
-        )
-
-        try:
-            with st.spinner(
-                "Calculando precipitación, percentiles locales, climatología y SPI..."
-            ):
-                daily_df = get_daily_rainfall(
-                    selected_id,
-                    start_date.isoformat(),
-                    selected_date.isoformat(),
-                    project_id,
-                )
-                reference_df = get_month_reference_rainfall(
-                    selected_id,
-                    selected_date.month,
-                    project_id,
-                )
-                thresholds = calculate_thresholds(reference_df, selected_date.month)
-
-                end_month = latest_complete_month(latest_date)
-                monthly_df = get_monthly_rainfall(
-                    selected_id,
-                    str(end_month),
-                    project_id,
-                )
-                spi_df = calculate_spi(monthly_df, int(spi_scale))
-        except Exception as exc:
-            st.error("No fue posible completar el análisis hidroclimático.")
-            st.code(str(exc), language="text")
-            st.info(
-                "Puedes limpiar la selección e intentar otra subcuenca. Si el error "
-                "persiste, revisa los permisos o cuotas de Earth Engine."
-            )
-            st.stop()
-
-        observation = selected_observation(daily_df, selected_date)
-        if observation is None:
-            observed_date = selected_date
-            observed_rain = math.nan
-        else:
-            observed_date, observed_rain = observation
-
-        if evaluation_mode == "Escenario manual":
-            default_scenario = float(round(thresholds.p90, 1))
-            maximum_scenario = float(max(200.0, math.ceil(thresholds.p99 * 1.8 / 10) * 10))
-            manual_rain = st.sidebar.number_input(
-                "Lluvia del escenario (mm/día)",
-                min_value=0.0,
-                max_value=maximum_scenario,
-                value=min(default_scenario, maximum_scenario),
-                step=1.0,
-            )
-            evaluated_rain = float(manual_rain)
-            evaluation_label = f"Escenario manual: {evaluated_rain:.1f} mm/día"
-        else:
-            evaluated_rain = float(observed_rain)
-            evaluation_label = (
-                f"CHIRPS {observed_date:%d/%m/%Y}: {evaluated_rain:.1f} mm/día"
-                if np.isfinite(evaluated_rain)
-                else "Sin observación disponible"
-            )
-
-        # Sobrescribir KPIs con valores reales. Streamlit los muestra aquí como bloque final.
-        st.markdown("#### Umbrales calculados para la selección")
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("HYBAS_ID", selected_id, MONTH_NAMES[selected_date.month])
-        k2.metric("P90 local", f"{thresholds.p90:.1f} mm/día", "Preventivo")
-        k3.metric("P95 local", f"{thresholds.p95:.1f} mm/día", "Muy alto")
-        k4.metric("P99 local", f"{thresholds.p99:.1f} mm/día", "Extremo")
-
-        tab_summary, tab_daily, tab_climate, tab_downloads = st.tabs(
-            [
-                "📊 Resumen",
-                "🌧️ Lluvia diaria y umbrales",
-                "☀️ Climatología y SPI",
-                "⬇️ Descargas",
-            ]
-        )
-
-        # -------------------------------------------------------------------------
-        # Resumen
-        # -------------------------------------------------------------------------
-        with tab_summary:
-            st.subheader("Evaluación territorial")
-
-            if np.isfinite(evaluated_rain):
-                flood_alert = evaluate_flood_alert(evaluated_rain, thresholds)
-                render_alert_card(flood_alert, selected_id, evaluation_label)
-            else:
-                flood_alert = None
-                st.warning("No hay una observación CHIRPS disponible para la fecha evaluada.")
-
-            area1, area2, acc3, acc7, acc30 = st.columns(5)
-            area1.metric(
-                "Área local",
-                safe_metric(float(properties.get("SUB_AREA", math.nan)), " km²"),
-            )
-            area2.metric(
-                "Área aguas arriba",
-                safe_metric(float(properties.get("UP_AREA", math.nan)), " km²"),
-            )
-            acc3.metric(
-                "Acumulado 3 días",
-                safe_metric(sum_last_days(daily_df, observed_date, 3), " mm"),
-            )
-            acc7.metric(
-                "Acumulado 7 días",
-                safe_metric(sum_last_days(daily_df, observed_date, 7), " mm"),
-            )
-            acc30.metric(
-                "Acumulado 30 días",
-                safe_metric(sum_last_days(daily_df, observed_date, 30), " mm"),
-            )
-
-            latest_spi_rows = spi_df.loc[
-                spi_df["fecha"] <= pd.Timestamp(selected_date),
-            ].dropna(subset=["spi"])
-            latest_spi = (
-                float(latest_spi_rows.iloc[-1]["spi"])
-                if not latest_spi_rows.empty
-                else math.nan
-            )
-            latest_spi_date = (
-                latest_spi_rows.iloc[-1]["fecha"].date()
-                if not latest_spi_rows.empty
-                else None
-            )
-
-            st.subheader(f"Condición de sequía — SPI-{spi_scale}")
-            if np.isfinite(latest_spi):
-                drought_alert = evaluate_drought_alert(latest_spi)
-                render_alert_card(
-                    drought_alert,
-                    selected_id,
-                    f"{latest_spi_date:%m/%Y} · SPI-{spi_scale} = {latest_spi:.2f}",
-                )
-            else:
-                drought_alert = None
-                st.info("No fue posible calcular SPI para el período seleccionado.")
-
-            st.markdown(
-                f"""
-                <div class="method-card">
-                    <b>Cómo se obtuvieron los umbrales:</b> se calculó la precipitación diaria
-                    media espacial de la subcuenca para todos los días de
-                    <b>{MONTH_NAMES[selected_date.month]}</b> entre
-                    <b>{REFERENCE_START_YEAR} y {REFERENCE_END_YEAR}</b>. Después se conservaron
-                    los días con lluvia ≥ {WET_DAY_THRESHOLD_MM:.0f} mm y se calcularon los
-                    percentiles P90, P95 y P99. Muestra: <b>{thresholds.sample_wet}</b> días
-                    húmedos de <b>{thresholds.sample_all}</b> días disponibles.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        # -------------------------------------------------------------------------
-        # Lluvia diaria
-        # -------------------------------------------------------------------------
-        with tab_daily:
-            st.plotly_chart(
-                daily_rainfall_chart(daily_df, thresholds, observed_date),
-                use_container_width=True,
-                config={"displaylogo": False, "scrollZoom": False},
-            )
-
-            left_chart, right_chart = st.columns([1.6, 1])
-            with left_chart:
-                st.plotly_chart(
-                    reference_distribution_chart(reference_df, thresholds),
-                    use_container_width=True,
-                    config={"displaylogo": False},
-                )
-            with right_chart:
-                threshold_table = pd.DataFrame(
-                    {
-                        "Indicador": ["P90", "P95", "P99"],
-                        "Valor_mm_dia": [
-                            thresholds.p90,
-                            thresholds.p95,
-                            thresholds.p99,
-                        ],
-                        "Interpretación": [
-                            "Preventivo",
-                            "Muy alto",
-                            "Extremo",
-                        ],
-                    }
-                )
-                st.markdown("#### Tabla de umbrales")
-                st.dataframe(
-                    threshold_table.style.format({"Valor_mm_dia": "{:.2f}"}),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                st.markdown("#### Datos diarios")
-                table_daily = daily_df.copy()
-                table_daily["fecha"] = table_daily["fecha"].dt.strftime("%Y-%m-%d")
-                st.dataframe(
-                    table_daily.tail(30),
-                    use_container_width=True,
-                    hide_index=True,
-                    height=360,
-                )
-
-        # -------------------------------------------------------------------------
-        # Climatología y SPI
-        # -------------------------------------------------------------------------
-        with tab_climate:
-            chart_col1, chart_col2 = st.columns(2)
-            with chart_col1:
-                st.plotly_chart(
-                    monthly_climatology_chart(monthly_df),
-                    use_container_width=True,
-                    config={"displaylogo": False},
-                )
-            with chart_col2:
-                st.plotly_chart(
-                    monthly_series_chart(monthly_df),
-                    use_container_width=True,
-                    config={"displaylogo": False},
-                )
-
-            st.plotly_chart(
-                spi_chart(spi_df, int(spi_scale)),
-                use_container_width=True,
-                config={"displaylogo": False},
-            )
-
-            spi_table = spi_df.dropna(subset=["spi"]).tail(24).copy()
-            spi_table["fecha"] = spi_table["fecha"].dt.strftime("%Y-%m")
-            spi_table = spi_table[
-                ["fecha", "precipitacion_mm", "acumulado_mm", "spi", "escala_meses"]
-            ]
-            st.dataframe(
-                spi_table.style.format(
-                    {
-                        "precipitacion_mm": "{:.2f}",
-                        "acumulado_mm": "{:.2f}",
-                        "spi": "{:.2f}",
-                    }
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        # -------------------------------------------------------------------------
-        # Descargas
-        # -------------------------------------------------------------------------
-        with tab_downloads:
-            st.subheader("Descarga de resultados")
-
-            thresholds_df = pd.DataFrame(
-                [
-                    {
-                        "HYBAS_ID": selected_id,
-                        "mes": selected_date.month,
-                        "mes_nombre": MONTH_NAMES[selected_date.month],
-                        "periodo_referencia": (
-                            f"{REFERENCE_START_YEAR}-{REFERENCE_END_YEAR}"
-                        ),
-                        "criterio_dia_humedo_mm": WET_DAY_THRESHOLD_MM,
-                        "muestra_total_dias": thresholds.sample_all,
-                        "muestra_dias_humedos": thresholds.sample_wet,
-                        "P90_mm_dia": thresholds.p90,
-                        "P95_mm_dia": thresholds.p95,
-                        "P99_mm_dia": thresholds.p99,
-                    }
-                ]
-            )
-
-            latest_spi_value = (
-                latest_spi if np.isfinite(latest_spi) else None
-            )
-            summary_df = pd.DataFrame(
-                [
-                    {
-                        "HYBAS_ID": selected_id,
-                        "MAIN_BAS": properties.get("MAIN_BAS"),
-                        "SUB_AREA_km2": properties.get("SUB_AREA"),
-                        "UP_AREA_km2": properties.get("UP_AREA"),
-                        "fecha_solicitada": selected_date.isoformat(),
-                        "fecha_observada": observed_date.isoformat(),
-                        "precipitacion_evaluada_mm_dia": (
-                            evaluated_rain if np.isfinite(evaluated_rain) else None
-                        ),
-                        "modo_evaluacion": evaluation_mode,
-                        "alerta_lluvia": flood_alert.level if flood_alert else None,
-                        "SPI_escala_meses": spi_scale,
-                        "SPI_fecha": (
-                            latest_spi_date.isoformat() if latest_spi_date else None
-                        ),
-                        "SPI_valor": latest_spi_value,
-                        "alerta_sequia": drought_alert.level if drought_alert else None,
-                        "fuente": CHIRPS_ASSET,
-                    }
-                ]
-            )
-
-            export_daily = daily_df.copy()
-            export_daily["HYBAS_ID"] = selected_id
-            export_monthly = monthly_df.copy()
-            export_monthly["HYBAS_ID"] = selected_id
-            export_spi = spi_df.copy()
-            export_spi["HYBAS_ID"] = selected_id
-
-            files = {
-                f"resumen_{selected_id}.csv": dataframe_csv_bytes(summary_df),
-                f"umbrales_{selected_id}_{selected_date.month:02d}.csv": dataframe_csv_bytes(
-                    thresholds_df
-                ),
-                f"precipitacion_diaria_{selected_id}.csv": dataframe_csv_bytes(
-                    export_daily
-                ),
-                f"precipitacion_mensual_{selected_id}.csv": dataframe_csv_bytes(
-                    export_monthly
-                ),
-                f"spi_{spi_scale}_{selected_id}.csv": dataframe_csv_bytes(export_spi),
-                f"subcuenca_{selected_id}.geojson": selected_geojson_bytes(
-                    selected_feature
-                ),
-            }
-
-            st.download_button(
-                "📦 Descargar paquete completo ZIP",
-                data=create_download_zip(files),
-                file_name=f"SAT_Rio_Lempa_{selected_id}.zip",
-                mime="application/zip",
-                type="primary",
-                width="stretch",
-                on_click="ignore",
-            )
-
-            download_columns = st.columns(3)
-            with download_columns[0]:
-                st.download_button(
-                    "Resumen CSV",
-                    dataframe_csv_bytes(summary_df),
-                    file_name=f"resumen_{selected_id}.csv",
-                    mime="text/csv",
-                    width="stretch",
-                    on_click="ignore",
-                )
-                st.download_button(
-                    "Serie diaria CSV",
-                    dataframe_csv_bytes(export_daily),
-                    file_name=f"precipitacion_diaria_{selected_id}.csv",
-                    mime="text/csv",
-                    width="stretch",
-                    on_click="ignore",
-                )
-            with download_columns[1]:
-                st.download_button(
-                    "Umbrales CSV",
-                    dataframe_csv_bytes(thresholds_df),
-                    file_name=f"umbrales_{selected_id}.csv",
-                    mime="text/csv",
-                    width="stretch",
-                    on_click="ignore",
-                )
-                st.download_button(
-                    "Serie mensual CSV",
-                    dataframe_csv_bytes(export_monthly),
-                    file_name=f"precipitacion_mensual_{selected_id}.csv",
-                    mime="text/csv",
-                    width="stretch",
-                    on_click="ignore",
-                )
-            with download_columns[2]:
-                st.download_button(
-                    f"SPI-{spi_scale} CSV",
-                    dataframe_csv_bytes(export_spi),
-                    file_name=f"spi_{spi_scale}_{selected_id}.csv",
-                    mime="text/csv",
-                    width="stretch",
-                    on_click="ignore",
-                )
-                st.download_button(
-                    "Subcuenca GeoJSON",
-                    selected_geojson_bytes(selected_feature),
-                    file_name=f"subcuenca_{selected_id}.geojson",
-                    mime="application/geo+json",
-                    width="stretch",
-                    on_click="ignore",
-                )
-
-            st.caption(
-                "Los CSV se exportan con codificación UTF-8 con BOM para facilitar su "
-                "apertura en Excel."
-            )
-
-        with st.expander("ℹ️ Alcance, datos y uso responsable"):
-            st.markdown(
-                f"""
-                - **CHIRPS** es una estimación satelital combinada con estaciones; no sustituye
-                  mediciones hidrometeorológicas locales ni pronósticos oficiales.
-                - La precipitación mostrada es la **media espacial** de la subcuenca, no el
-                  máximo puntual dentro de ella.
-                - Los percentiles son estadísticos hidroclimáticos reales calculados con
-                  CHIRPS, pero **no equivalen por sí solos a umbrales oficiales de inundación**.
-                  Para operación institucional deben combinarse con niveles de río, humedad
-                  antecedente, topografía, exposición, vulnerabilidad y protocolos nacionales.
-                - El SPI se calcula con período de referencia
-                  **{REFERENCE_START_YEAR}–{REFERENCE_END_YEAR}** y distribución gamma.
-                - Delimitación: HydroSHEDS nivel 12. Fuente de lluvia: `{CHIRPS_ASSET}`.
-                """
-            )
-
 if __name__ == "__main__":
     main()
