@@ -1241,8 +1241,9 @@ def render_general_monitoring_tab(
         """
         <div class="sat-note">
             Esta sección revisa todas las subcuencas disponibles y señala cuáles requieren
-            <b>monitoreo hidroclimático</b>. El cálculo
-            se ejecuta únicamente al presionar el botón.
+            <b>monitoreo hidroclimático</b>. Para cuidar la cuota de Earth Engine, el cálculo
+            se ejecuta únicamente al presionar el botón y los resultados históricos se
+            conservan en caché.
         </div>
         """,
         unsafe_allow_html=True,
@@ -1888,6 +1889,410 @@ def selected_geojson_bytes(feature: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
+
+def create_pdf_report(
+    summary_df: pd.DataFrame,
+    thresholds_df: pd.DataFrame,
+) -> bytes:
+    """Genera un reporte hidroclimático PDF para la subcuenca seleccionada."""
+
+    from xml.sax.saxutils import escape
+
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import cm
+    from reportlab.platypus import (
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    if summary_df.empty:
+        raise ValueError("No existen datos de resumen para generar el PDF.")
+
+    summary = summary_df.iloc[0].to_dict()
+    thresholds = (
+        thresholds_df.iloc[0].to_dict()
+        if not thresholds_df.empty
+        else {}
+    )
+
+    def safe_text(value: Any) -> str:
+        if value is None:
+            return "N/D"
+        try:
+            if pd.isna(value):
+                return "N/D"
+        except (TypeError, ValueError):
+            pass
+        return escape(str(value))
+
+    def number_text(
+        value: Any,
+        suffix: str = "",
+        decimals: int = 2,
+    ) -> str:
+        if value is None:
+            return "N/D"
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return safe_text(value)
+        if not np.isfinite(numeric):
+            return "N/D"
+        return f"{numeric:,.{decimals}f}{suffix}"
+
+    buffer = io.BytesIO()
+
+    document = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=1.7 * cm,
+        leftMargin=1.7 * cm,
+        topMargin=1.7 * cm,
+        bottomMargin=1.8 * cm,
+        title=(
+            "Reporte hidroclimático - "
+            f"Subcuenca {safe_text(summary.get('HYBAS_ID'))}"
+        ),
+        author="Susana Melgar - Programa Somos Río Lempa",
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "SATTitle",
+        parent=styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=17,
+        leading=21,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#0f172a"),
+        spaceAfter=8,
+    )
+
+    subtitle_style = ParagraphStyle(
+        "SATSubtitle",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=9.5,
+        leading=13,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#475569"),
+        spaceAfter=14,
+    )
+
+    heading_style = ParagraphStyle(
+        "SATHeading",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=12,
+        leading=15,
+        textColor=colors.HexColor("#1e3a8a"),
+        spaceBefore=8,
+        spaceAfter=7,
+    )
+
+    body_style = ParagraphStyle(
+        "SATBody",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=9,
+        leading=13,
+        textColor=colors.HexColor("#334155"),
+    )
+
+    small_style = ParagraphStyle(
+        "SATSmall",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=8,
+        leading=11,
+        textColor=colors.HexColor("#64748b"),
+    )
+
+    story = [
+        Paragraph(
+            "Sistema de Alerta Temprana - Cuenca del Río Lempa",
+            title_style,
+        ),
+        Paragraph(
+            "Reporte hidroclimático por subcuenca",
+            subtitle_style,
+        ),
+        Paragraph("Resumen de la evaluación", heading_style),
+    ]
+
+    spi_scale = safe_text(summary.get("SPI_escala_meses"))
+
+    summary_rows = [
+        [
+            Paragraph("<b>Indicador</b>", body_style),
+            Paragraph("<b>Resultado</b>", body_style),
+        ],
+        [
+            "HYBAS_ID",
+            safe_text(summary.get("HYBAS_ID")),
+        ],
+        [
+            "Cuenca principal",
+            safe_text(summary.get("MAIN_BAS")),
+        ],
+        [
+            "Área local",
+            number_text(summary.get("SUB_AREA_km2"), " km²"),
+        ],
+        [
+            "Área aguas arriba",
+            number_text(summary.get("UP_AREA_km2"), " km²"),
+        ],
+        [
+            "Fecha solicitada",
+            safe_text(summary.get("fecha_solicitada")),
+        ],
+        [
+            "Fecha CHIRPS utilizada",
+            safe_text(summary.get("fecha_observada")),
+        ],
+        [
+            "Modo de evaluación",
+            safe_text(summary.get("modo_evaluacion")),
+        ],
+        [
+            "Precipitación evaluada",
+            number_text(
+                summary.get("precipitacion_evaluada_mm_dia"),
+                " mm/día",
+            ),
+        ],
+        [
+            "Alerta de lluvia",
+            safe_text(summary.get("alerta_lluvia")),
+        ],
+        [
+            "Acumulado de 3 días",
+            number_text(
+                summary.get("acumulado_3_dias_mm"),
+                " mm",
+            ),
+        ],
+        [
+            "Acumulado de 7 días",
+            number_text(
+                summary.get("acumulado_7_dias_mm"),
+                " mm",
+            ),
+        ],
+        [
+            "Acumulado de 30 días",
+            number_text(
+                summary.get("acumulado_30_dias_mm"),
+                " mm",
+            ),
+        ],
+        [
+            f"SPI-{spi_scale}",
+            number_text(summary.get("SPI_valor")),
+        ],
+        [
+            "Fecha del SPI",
+            safe_text(summary.get("SPI_fecha")),
+        ],
+        [
+            "Condición de sequía",
+            safe_text(summary.get("alerta_sequia")),
+        ],
+    ]
+
+    summary_table = Table(
+        summary_rows,
+        colWidths=[6.2 * cm, 10.4 * cm],
+        repeatRows=1,
+        hAlign="LEFT",
+    )
+
+    summary_table.setStyle(
+        TableStyle(
+            [
+                (
+                    "BACKGROUND",
+                    (0, 0),
+                    (-1, 0),
+                    colors.HexColor("#dbeafe"),
+                ),
+                (
+                    "TEXTCOLOR",
+                    (0, 0),
+                    (-1, 0),
+                    colors.HexColor("#0f172a"),
+                ),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
+                ("FONTNAME", (1, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8.7),
+                ("LEADING", (0, 0), (-1, -1), 11),
+                (
+                    "GRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.45,
+                    colors.HexColor("#cbd5e1"),
+                ),
+                (
+                    "ROWBACKGROUNDS",
+                    (0, 1),
+                    (-1, -1),
+                    [
+                        colors.HexColor("#ffffff"),
+                        colors.HexColor("#f8fafc"),
+                    ],
+                ),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+
+    story.extend(
+        [
+            summary_table,
+            Spacer(1, 0.35 * cm),
+            Paragraph("Umbrales locales de precipitación", heading_style),
+        ]
+    )
+
+    threshold_rows = [
+        [
+            Paragraph("<b>Umbral</b>", body_style),
+            Paragraph("<b>Valor</b>", body_style),
+            Paragraph("<b>Interpretación</b>", body_style),
+        ],
+        [
+            "P90",
+            number_text(thresholds.get("P90_mm_dia"), " mm/día"),
+            "Fase preventiva",
+        ],
+        [
+            "P95",
+            number_text(thresholds.get("P95_mm_dia"), " mm/día"),
+            "Condición muy alta",
+        ],
+        [
+            "P99",
+            number_text(thresholds.get("P99_mm_dia"), " mm/día"),
+            "Precipitación extrema",
+        ],
+    ]
+
+    threshold_table = Table(
+        threshold_rows,
+        colWidths=[3.2 * cm, 5.2 * cm, 8.2 * cm],
+        repeatRows=1,
+        hAlign="LEFT",
+    )
+
+    threshold_table.setStyle(
+        TableStyle(
+            [
+                (
+                    "BACKGROUND",
+                    (0, 0),
+                    (-1, 0),
+                    colors.HexColor("#e2e8f0"),
+                ),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8.7),
+                (
+                    "GRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.45,
+                    colors.HexColor("#cbd5e1"),
+                ),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+
+    story.extend(
+        [
+            threshold_table,
+            Spacer(1, 0.35 * cm),
+            Paragraph("Metodología y alcance", heading_style),
+            Paragraph(
+                (
+                    "La precipitación corresponde a la media espacial CHIRPS de la "
+                    "subcuenca. Los umbrales P90, P95 y P99 se calcularon para el mismo "
+                    "mes calendario durante "
+                    f"{REFERENCE_START_YEAR}-{REFERENCE_END_YEAR}, utilizando días "
+                    f"húmedos con precipitación mayor o igual a "
+                    f"{WET_DAY_THRESHOLD_MM:.0f} mm. El SPI se interpreta como un "
+                    "indicador de sequía meteorológica."
+                ),
+                body_style,
+            ),
+            Spacer(1, 0.2 * cm),
+            Paragraph(
+                (
+                    "Este reporte constituye una señal de monitoreo hidroclimático. "
+                    "No sustituye avisos oficiales ni incorpora por sí solo caudales, "
+                    "niveles de río, exposición o vulnerabilidad."
+                ),
+                small_style,
+            ),
+            Spacer(1, 0.15 * cm),
+            Paragraph(
+                "Fuente de precipitación: CHIRPS Daily / Google Earth Engine.",
+                small_style,
+            ),
+        ]
+    )
+
+    def draw_footer(canvas: Any, doc: Any) -> None:
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor("#cbd5e1"))
+        canvas.setLineWidth(0.4)
+        canvas.line(
+            doc.leftMargin,
+            1.35 * cm,
+            letter[0] - doc.rightMargin,
+            1.35 * cm,
+        )
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(colors.HexColor("#64748b"))
+        canvas.drawString(
+            doc.leftMargin,
+            0.9 * cm,
+            "SAT Río Lempa - Programa Somos Río Lempa",
+        )
+        canvas.drawRightString(
+            letter[0] - doc.rightMargin,
+            0.9 * cm,
+            f"Página {doc.page}",
+        )
+        canvas.restoreState()
+
+    document.build(
+        story,
+        onFirstPage=draw_footer,
+        onLaterPages=draw_footer,
+    )
+
+    return buffer.getvalue()
+
+
 def create_download_zip(files: dict[str, bytes]) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -2503,6 +2908,27 @@ def main() -> None:
                             ),
                             "modo_evaluacion": evaluation_mode,
                             "alerta_lluvia": flood_alert.level if flood_alert else None,
+                            "acumulado_3_dias_mm": (
+                                sum_last_days(daily_df, observed_date, 3)
+                                if np.isfinite(
+                                    sum_last_days(daily_df, observed_date, 3)
+                                )
+                                else None
+                            ),
+                            "acumulado_7_dias_mm": (
+                                sum_last_days(daily_df, observed_date, 7)
+                                if np.isfinite(
+                                    sum_last_days(daily_df, observed_date, 7)
+                                )
+                                else None
+                            ),
+                            "acumulado_30_dias_mm": (
+                                sum_last_days(daily_df, observed_date, 30)
+                                if np.isfinite(
+                                    sum_last_days(daily_df, observed_date, 30)
+                                )
+                                else None
+                            ),
                             "SPI_escala_meses": spi_scale,
                             "SPI_fecha": (
                                 latest_spi_date.isoformat() if latest_spi_date else None
@@ -2521,7 +2947,13 @@ def main() -> None:
                 export_spi = spi_df.copy()
                 export_spi["HYBAS_ID"] = selected_id
 
+                pdf_report = create_pdf_report(
+                    summary_df,
+                    thresholds_df,
+                )
+
                 files = {
+                    f"reporte_hidroclimatico_{selected_id}.pdf": pdf_report,
                     f"resumen_{selected_id}.csv": dataframe_csv_bytes(summary_df),
                     f"umbrales_{selected_id}_{selected_date.month:02d}.csv": dataframe_csv_bytes(
                         thresholds_df
@@ -2538,15 +2970,30 @@ def main() -> None:
                     ),
                 }
 
-                st.download_button(
-                    "📦 Descargar paquete completo ZIP",
-                    data=create_download_zip(files),
-                    file_name=f"SAT_Rio_Lempa_{selected_id}.zip",
-                    mime="application/zip",
-                    type="primary",
-                    width="stretch",
-                    on_click="ignore",
-                )
+                primary_downloads = st.columns(2)
+
+                with primary_downloads[0]:
+                    st.download_button(
+                        "📄 Descargar reporte PDF",
+                        data=pdf_report,
+                        file_name=(
+                            f"reporte_hidroclimatico_{selected_id}.pdf"
+                        ),
+                        mime="application/pdf",
+                        type="primary",
+                        width="stretch",
+                        on_click="ignore",
+                    )
+
+                with primary_downloads[1]:
+                    st.download_button(
+                        "📦 Descargar paquete completo ZIP",
+                        data=create_download_zip(files),
+                        file_name=f"SAT_Rio_Lempa_{selected_id}.zip",
+                        mime="application/zip",
+                        width="stretch",
+                        on_click="ignore",
+                    )
 
                 download_columns = st.columns(3)
                 with download_columns[0]:
