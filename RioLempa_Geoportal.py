@@ -1241,9 +1241,8 @@ def render_general_monitoring_tab(
         """
         <div class="sat-note">
             Esta sección revisa todas las subcuencas disponibles y señala cuáles requieren
-            <b>monitoreo hidroclimático</b>. Para cuidar la cuota de Earth Engine, el cálculo
-            se ejecuta únicamente al presionar el botón y los resultados históricos se
-            conservan en caché.
+            <b>monitoreo hidroclimático</b>. El cálculo
+            se ejecuta únicamente al presionar el botón.
         </div>
         """,
         unsafe_allow_html=True,
